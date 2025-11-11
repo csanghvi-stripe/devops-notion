@@ -1,0 +1,19 @@
+# Core LangChain
+langchain==0.3.12
+langchain-community==0.3.12
+langchain-openai==0.2.5
+
+# Web & API
+Flask==3.0.3
+requests==2.32.3
+
+# Integrations
+slack-sdk==3.33.0
+PyGithub==2.4.0
+notion-client==2.3.0
+
+# Environment & Utils
+python-dotenv==1.0.1
+
+# Optional: For richer logging or async support (recommended)
+gunicorn==23.0.0
