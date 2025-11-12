@@ -123,9 +123,10 @@ class NotionService:
             True if successful, False otherwise
         """
         try:
+            # Try using "status" type first (newer Notion status property)
             properties = {
                 "Status": {
-                    "select": {
+                    "status": {
                         "name": status
                     }
                 }
@@ -136,9 +137,24 @@ class NotionService:
                     "url": pr_link
                 }
 
-            self.client.pages.update(page_id=page_id, properties=properties)
-            logger.info(f"Updated Notion page {page_id} to status '{status}'")
-            return True
+            try:
+                self.client.pages.update(page_id=page_id, properties=properties)
+                logger.info(f"Updated Notion page {page_id} to status '{status}'")
+                return True
+            except Exception as e:
+                # If "status" type fails, try "select" type (older property type)
+                if "is expected to be select" in str(e):
+                    logger.info("Retrying with 'select' property type")
+                    properties["Status"] = {
+                        "select": {
+                            "name": status
+                        }
+                    }
+                    self.client.pages.update(page_id=page_id, properties=properties)
+                    logger.info(f"Updated Notion page {page_id} to status '{status}'")
+                    return True
+                else:
+                    raise
 
         except Exception as e:
             logger.error(f"Error updating Notion page {page_id}: {e}")
@@ -495,17 +511,21 @@ class DevOpsBot:
         if not pr_body:
             return None
 
-        # Match patterns like "Notion Task: TASK-042" or "Task: TASK-001"
+        # Match patterns with specific prefixes first (more precise)
         patterns = [
             r'Notion Task:\s*([A-Z]+-\d+)',
             r'Task:\s*([A-Z]+-\d+)',
-            r'Task ID:\s*([A-Z]+-\d+)'
+            r'Task ID:\s*([A-Z]+-\d+)',
+            # More flexible pattern - matches any TASK-## format anywhere in text
+            r'\b([A-Z]+-\d+)\b'
         ]
 
         for pattern in patterns:
             match = re.search(pattern, pr_body, re.IGNORECASE)
             if match:
-                return match.group(1)
+                task_id = match.group(1).upper()
+                logger.info(f"Extracted task ID: {task_id}")
+                return task_id
 
         return None
 
@@ -707,8 +727,9 @@ def slack_interactions():
         payload = json.loads(request.form.get('payload'))
         action = payload['actions'][0]
         action_id = action['action_id']
+        user = payload['user']['username']
 
-        logger.info(f"Received Slack interaction: {action_id}")
+        logger.info(f"Received Slack interaction: {action_id} from user {user}")
 
         if action_id == 'approve_pr':
             # Parse action value
@@ -720,14 +741,56 @@ def slack_interactions():
             # Handle PR approval
             result = bot.handle_pr_approval(pr_number, task_id, notion_page_id)
 
-            # Respond to Slack
+            # Respond to Slack with rich confirmation
             if result['status'] == 'success':
+                # Get PR URL from GitHub
+                pr_url = f"https://github.com/{config.github_repository}/pull/{pr_number}"
+
+                # Send confirmation message back to Slack channel
+                try:
+                    bot.slack.client.chat_postMessage(
+                        channel=bot.slack.default_channel,
+                        text=f"✅ PR #{pr_number} merged successfully!",
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"✅ *PR Merged Successfully!*\n\n*PR:* <{pr_url}|#{pr_number}>\n*Task:* {task_id}\n*Approved by:* @{user}\n*Status:* Notion task marked as `Done`"
+                                }
+                            }
+                        ]
+                    )
+                except Exception as slack_error:
+                    logger.error(f"Failed to send Slack confirmation: {slack_error}")
+
+                # Update the original message to show it's been processed
                 return jsonify({
-                    "text": f"✅ {result['message']}"
+                    "replace_original": True,
+                    "text": f"✅ PR #{pr_number} was merged by @{user}",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"✅ *PR Merged*\n\nPR #{pr_number} was approved and merged by @{user}\nTask {task_id} marked as Done"
+                            }
+                        },
+                        {
+                            "type": "context",
+                            "elements": [
+                                {
+                                    "type": "mrkdwn",
+                                    "text": f"View PR: <{pr_url}|#{pr_number}>"
+                                }
+                            ]
+                        }
+                    ]
                 })
             else:
                 return jsonify({
-                    "text": f"❌ Error: {result['message']}"
+                    "replace_original": False,
+                    "text": f"❌ *Merge Failed*\n\n{result['message']}\n\nPlease check the PR status and try again manually."
                 })
 
         elif action_id == 'request_changes':
@@ -736,14 +799,18 @@ def slack_interactions():
             pr_url = action_value['pr_url']
 
             return jsonify({
-                "text": f"👀 Please review and request changes on the PR: {pr_url}"
+                "replace_original": False,
+                "text": f"👀 @{user} requested changes on this PR. Please review: {pr_url}"
             })
 
         return jsonify({"text": "Action processed"}), 200
 
     except Exception as e:
         logger.error(f"Slack interaction error: {e}", exc_info=True)
-        return jsonify({"text": f"Error: {str(e)}"}), 500
+        return jsonify({
+            "replace_original": False,
+            "text": f"❌ Error processing action: {str(e)}"
+        }), 500
 
 
 if __name__ == '__main__':
@@ -751,5 +818,6 @@ if __name__ == '__main__':
         logger.error("Cannot start server - bot initialization failed")
         exit(1)
 
-    logger.info("Starting DevOps Flow Bot on port 5000...")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.getenv('PORT', 5001))
+    logger.info(f"Starting DevOps Flow Bot on port {port}...")
+    app.run(host='0.0.0.0', port=port, debug=False)
